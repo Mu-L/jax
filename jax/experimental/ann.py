@@ -12,19 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
-from typing import (Any, Tuple)
-
-import numpy as np
-from jax import lax, core
-from jax._src.lib import xla_bridge as xb
-from jax._src.lib import xla_client as xc
-from jax._src import ad_util, dtypes
-
-from jax.interpreters import ad, xla, batching
-
-Array = Any
-r"""ANN (Approximate Nearest Neighbor) is an **experimental** module for fast top-k with a configurable recall rate on TPU.
+"""ANN (Approximate Nearest Neighbor) is an **experimental** module for fast top-k with a configurable recall rate on TPU.
 
 TPUs are highly efficient on matrix multiplication, which scales up by TPU
 generation. Nevertheless, TPUs are surprisingly inefficient in the other
@@ -51,7 +39,7 @@ A quick estimate is the output would roughly be :math:`M=10*K` for 90% target
 recall, and :math:`M=100*K` for 99% target recall. The smaller the output, the
 smaller memory bandwidth it consumes.
 
-Example usage:
+Example usage::
 
   from jax.experimental import ann
   # Maximum inner product search
@@ -66,7 +54,21 @@ for JAX in the future.
   * On host top-k aggregation
   * Accurate but slow differentiation
   * Inaccurate but fast differentiation
+
 """
+
+from functools import partial
+from typing import (Any, Tuple)
+
+import numpy as np
+from jax import lax, core
+from jax._src.lib import xla_bridge as xb
+from jax._src.lib import xla_client as xc
+from jax._src import ad_util, dtypes
+
+from jax.interpreters import ad, xla, batching
+
+Array = Any
 
 
 def approx_max_k(operand: Array,
