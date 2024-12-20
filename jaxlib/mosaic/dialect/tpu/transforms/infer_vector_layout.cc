@@ -142,7 +142,8 @@ class VectorLayoutInferer {
       // TODO: b/342235360 - This check is temporary while we increase and test
       // support for offsets outside of the first tile. When support is more
       // broad, any op without support should check it within their own rule.
-      if (!isa<vector::BroadcastOp, vector::ExtractStridedSliceOp>(any_op)) {
+      if (!isa<arith::TruncIOp, arith::TruncFOp, vector::BroadcastOp,
+               vector::ExtractStridedSliceOp>(any_op)) {
         const SmallVector<Layout> layouts_in = getLayoutFromOperands(&any_op);
         for (const Layout &layout : layouts_in) {
           if (layout &&
@@ -182,11 +183,6 @@ class VectorLayoutInferer {
         auto false_ty = dyn_cast<VectorType>(op.getFalseValue().getType());
         TPU_CHECK_OP(static_cast<bool>(true_ty) == static_cast<bool>(false_ty),
                      "Only one side of arith is a vector?");
-        if (true_ty) {
-          TPU_CHECK_OP(true_ty.getElementTypeBitWidth() == kNativeBitwidth &&
-                           false_ty.getElementTypeBitWidth() == kNativeBitwidth,
-                       "Only 32-bit select supported");
-        }
         if (inferElementwise(&any_op).failed()) {
           return failure();
         }
@@ -1704,23 +1700,22 @@ class VectorLayoutInferer {
     auto dst_ty = cast<VectorType>(op->getResult(0).getType());
     auto some_layout = getLayout(op->getOperand(0));
     TPU_CHECK_OP(some_layout.has_value(), "missing vector layout");
-    if (dyn_cast<arith::TruncFOp>(op)) {
-      TPU_CHECK_OP(src_ty.getElementTypeBitWidth() == 32 &&
-                       (dst_ty.getElementTypeBitWidth() == 16 ||
-                        dst_ty.getElementTypeBitWidth() == 8),
-                   "Only 32-bit to 8-bit or 16-bit truncation supported");
-    } else {
-      TPU_CHECK_OP(src_ty.getElementTypeBitWidth() == 32,
-                   "Only 32-bit truncation supported");
+    const unsigned src_bitwidth = src_ty.getElementTypeBitWidth();
+    const unsigned dst_bitwidth = dst_ty.getElementTypeBitWidth();
+    if (isa<arith::TruncFOp>(op)) {
+      TPU_CHECK_OP(
+          src_bitwidth == 32 && (dst_bitwidth == 16 || dst_bitwidth == 8),
+          "Only 32-bit to 16-bit or 8-bit float truncation supported");
     }
     auto &layout = *some_layout;
     bool select_native = allUsersRequireNativeTiling(op->getResult(0));
-    auto src_layout = VectorLayout(32, layout.offsets(), default_tiling_,
-                                   layout.implicit_dim());
+    auto src_layout = VectorLayout(
+        src_bitwidth, layout.offsets(),
+        select_native ? nativeTiling(src_bitwidth) : layout.tiling(),
+        layout.implicit_dim());
     auto dst_layout = VectorLayout(
-        dst_ty.getElementTypeBitWidth(), layout.offsets(),
-        select_native ? nativeTiling(dst_ty.getElementTypeBitWidth())
-                      : default_tiling_,
+        dst_bitwidth, layout.offsets(),
+        select_native ? nativeTiling(dst_bitwidth) : layout.tiling(),
         layout.implicit_dim());
     setLayout(op, src_layout, dst_layout);
     return success();
@@ -1971,32 +1966,6 @@ class VectorLayoutInferer {
   void setLayout(Operation *op, ArrayRef<Layout> in, ArrayRef<Layout> out) {
     setInLayout(op, in);
     setOutLayout(op, out);
-  }
-
-  SmallVector<Layout, 4> getInLayout(Operation *op) {
-    CHECK(op);
-    CHECK(op->getAttr("in_layout"));
-    auto in_attrs = op->getAttrOfType<ArrayAttr>("in_layout").getValue();
-    CHECK_EQ(in_attrs.size(), op->getNumOperands());
-    SmallVector<Layout, 4> in_layouts;
-    in_layouts.reserve(op->getNumOperands());
-    for (int i = 0; i < op->getNumOperands(); ++i) {
-      in_layouts.push_back(cast<VectorLayoutAttr>(in_attrs[i]).getLayout());
-    }
-    return in_layouts;
-  }
-
-  SmallVector<Layout, 4> getOutLayout(Operation *op) {
-    CHECK(op);
-    CHECK(op->getAttr("out_layout"));
-    auto out_attrs = op->getAttrOfType<ArrayAttr>("out_layout").getValue();
-    CHECK_EQ(out_attrs.size(), op->getNumResults());
-    SmallVector<Layout, 4> out_layouts;
-    out_layouts.reserve(op->getNumResults());
-    for (int i = 0; i < op->getNumResults(); ++i) {
-      out_layouts.push_back(cast<VectorLayoutAttr>(out_attrs[i]).getLayout());
-    }
-    return out_layouts;
   }
 
   Layout getLayout(Value v) {

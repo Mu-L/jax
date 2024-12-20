@@ -62,7 +62,7 @@ from jax._src.layout import DeviceLocalLayout, AutoLayout, Layout
 from jax._src.lib import xla_client as xc
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import hlo
-from jax._src.partition_spec import PartitionSpec, UnconstrainedSingleton
+from jax._src.partition_spec import PartitionSpec
 from jax._src.sharding import Sharding as JSharding
 from jax._src.mesh import AbstractMesh, Mesh
 from jax._src.sharding_impls import (
@@ -205,7 +205,7 @@ def _shard_np_array(xs, shardings, layouts, copy_semantics):
     devices = sharding._addressable_device_assignment
     if x.dtype == dtypes.float0:
       x = np.zeros(x.shape, dtype=np.dtype(bool))
-    aval = api_util.shaped_abstractify(x)
+    aval = core.shaped_abstractify(x)
     if layout is not None:
       results.append(api.device_put(x, Layout(layout, sharding)))
     else:
@@ -349,7 +349,7 @@ def xla_pmap_impl_lazy(
                         donated_invars=donated_invars,
                         is_explicit_global_axis_size=is_explicit_global_axis_size)
     return _emap_apply_fn
-  abstract_args = unsafe_map(xla.abstractify, args)
+  abstract_args = unsafe_map(core.abstractify, args)
   compiled_fun, fingerprint = parallel_callable(
       fun, backend, axis_name, axis_size, global_axis_size, devices, name,
       in_axes, out_axes_thunk, donated_invars,
@@ -360,7 +360,7 @@ def xla_pmap_impl_lazy(
     distributed_debug_log(("Running pmapped function", name),
                           ("python function", fun.f),
                           ("devices", devices),
-                          ("abstract args", map(xla.abstractify, args)),
+                          ("abstract args", map(core.abstractify, args)),
                           ("fingerprint", fingerprint))
   return compiled_fun
 
@@ -598,7 +598,7 @@ class MapTracer(core.Tracer):
 
   @property
   def aval(self):
-    aval = xla.abstractify(self.val)
+    aval = core.abstractify(self.val)
     shard_axes = dict(self.shard_axes)
     for axis_idx in sorted(shard_axes.values())[::-1]:
       aval = core.mapped_aval(aval.shape[axis_idx], axis_idx, aval)
@@ -1145,7 +1145,7 @@ class PmapExecutable(stages.XlaExecutable):
   @profiler.annotate_function
   def call(self, *args):
     # TODO(frostig): do we need to check sharding and sharded avals?
-    arg_avals = map(xla.abstractify, args)
+    arg_avals = map(core.abstractify, args)
     check_arg_avals_for_call(self.in_avals, arg_avals, self._jaxpr_debug_info)
     return self.unsafe_call(*args)  # pylint: disable=not-callable
 
@@ -1999,7 +1999,7 @@ def jaxpr_transfer_mem_kinds(
   return out
 
 
-def are_all_shardings_default_mem_kind(da_object, shardings):
+def are_all_shardings_default_mem_kind(da_object: xc.DeviceList, shardings):
   if da_object is None:
     return True
   try:
@@ -2084,38 +2084,32 @@ def get_out_layouts_via_propagation(closed_jaxpr: core.ClosedJaxpr
 
 
 def _get_num_devices(
-    shardings, device_assignment, lowering_platforms, prim_requires_devices
-    ) -> tuple[int, tuple[xc.Device, ...] | None]:
-  ext_abstract_mesh, concrete_sharding = None, False
+    shardings, device_assignment
+  ) -> tuple[int, tuple[xc.Device, ...] | None]:
+  """Number of lowering devices, and the device_assignment to use.
+
+  If all the specified shardings have an abstract mesh, then we are compiling
+  with abstract devices, and the returned device_assignment is None.
+  """
+  abstract_mesh, any_concrete_sharding = None, False
   for s in shardings:
     if isinstance(s, UnspecifiedValue):
       continue
     elif isinstance(s, NamedSharding) and isinstance(s.mesh, AbstractMesh):
-      if ext_abstract_mesh is not None and ext_abstract_mesh != s.mesh:
+      if abstract_mesh is not None and abstract_mesh != s.mesh:
         raise ValueError("AbstractMesh should be the same across all "
-                         f"shardings. Got {ext_abstract_mesh} and {s.mesh}")
-      ext_abstract_mesh = s.mesh
+                         f"shardings. Got {abstract_mesh} and {s.mesh}")
+      abstract_mesh = s.mesh
     else:
-      concrete_sharding = True
-  if (concrete_sharding and ext_abstract_mesh is not None and
-      len(device_assignment) != ext_abstract_mesh.size):
+      any_concrete_sharding = True
+  if (any_concrete_sharding and abstract_mesh is not None and
+      len(device_assignment) != abstract_mesh.size):
     raise ValueError(
-        f"AbstractMesh size: {ext_abstract_mesh.size} does not match the"
+        f"AbstractMesh size: {abstract_mesh.size} does not match the"
         f" device assignment size: {len(device_assignment)}")
-  if concrete_sharding:
+  if any_concrete_sharding or abstract_mesh is None:
     return len(device_assignment), device_assignment
-  if ext_abstract_mesh is None:
-    return len(device_assignment), device_assignment
-  if lowering_platforms is None:
-    raise ValueError(
-        "Passing lowering_platforms via"
-        " jit(f).trace(*args).lower(lowering_platforms=...) is required when"
-        " only AbstractMesh exists in a jitted computation.")
-  if prim_requires_devices:
-    raise ValueError(
-        "AbstractMesh cannot be used when jaxpr contains primitives that"
-        " require devices to be present during lowering.")
-  return ext_abstract_mesh.size, None
+  return abstract_mesh.size, None
 
 
 MaybeLayout = Sequence[Union[DeviceLocalLayout, AutoLayout, None]]
@@ -2168,8 +2162,7 @@ def _concretize_abstract_shardings(shardings, avals, device_assignment):
 
   out = []
   for s, a in zip(shardings, avals):
-    if (isinstance(s, UnspecifiedValue) and a.sharding is not None and
-        all(not isinstance(s, UnconstrainedSingleton) for s in a.sharding.spec)):
+    if isinstance(s, UnspecifiedValue) and a.sharding is not None:
       out.append(NamedSharding(_abstract_to_concrete_mesh(a.sharding.mesh),
                                a.sharding.spec))
     else:
@@ -2269,7 +2262,17 @@ def lower_sharding_computation(
   num_devices, device_assignment = _get_num_devices(  # type: ignore
       it.chain(unique_in_shardings, unique_out_shardings,
                unique_intermediate_shardings),
-      device_assignment, lowering_platforms, prim_requires_devices)
+      device_assignment)
+  if device_assignment is None:
+    if lowering_platforms is None:
+      raise ValueError(
+          "Passing lowering_platforms via jax.export or "
+          " jit(f).trace(*args).lower(lowering_platforms=...) is required when"
+          " only AbstractMesh exists in a jitted computation.")
+    if prim_requires_devices:
+      raise ValueError(
+          "AbstractMesh cannot be used when jaxpr contains primitives that"
+          " require devices to be present during lowering.")
 
   committed = bool(
       devices_from_context
@@ -2349,6 +2352,7 @@ def lower_sharding_computation(
       mut=mut,
       backend=backend,
       device_assignment=da_object,
+      num_devices=num_devices,
       committed=committed,
       in_layouts=in_layouts,
       out_layouts=out_layouts,
@@ -2787,6 +2791,11 @@ def _maybe_get_and_check_out_shardings(
           dtypes.issubdtype(aval.dtype, dtypes.extended)):
         xla_s = sharding_impls.logical_sharding(aval, xla_s)
       new_out_shardings.append(xla_s)
+    elif mlir.contains_unconstrained(orig):
+      if (aval is not core.abstract_token and
+          dtypes.issubdtype(aval.dtype, dtypes.extended)):
+        xla_s = sharding_impls.logical_sharding(aval, xla_s)
+      new_out_shardings.append(_gspmd_to_named_sharding(xla_s, orig))  # type: ignore
     else:
       xla_hlo_s = xla_s._to_xla_hlo_sharding(aval.ndim)
       orig_hlo_s = orig._to_xla_hlo_sharding(aval.ndim)  # pytype: disable=attribute-error
@@ -2874,6 +2883,7 @@ class UnloadedMeshExecutable:
                in_layouts: MaybeLayout,
                out_layouts: MaybeLayout,
                compiler_options_kvs: tuple[tuple[str, Any], ...],
+               num_devices: int,
                pmap_nreps: int = 1,
                mut: MutationData | None = None,
                shape_poly_state: mlir.ShapePolyLoweringState | None = None,
@@ -2883,6 +2893,7 @@ class UnloadedMeshExecutable:
                intermediate_shardings: Sequence[JSharding] | None = None,
                context_mesh: Mesh | None = None,
   ) -> MeshExecutable:
+    del num_devices  # For compilation, we have an actual device_assignment
     if (device_assignment is None or
         any(isinstance(s, NamedSharding) and isinstance(s.mesh, AbstractMesh)
             for s in it.chain(in_shardings, out_shardings))):
@@ -2898,10 +2909,11 @@ class UnloadedMeshExecutable:
       da = _create_da_object(tuple(device_assignment))
     del device_assignment
 
-    allow_prop_to_inputs = tuple(isinstance(i, (UnspecifiedValue, AUTO))
-                                 for i in in_shardings)
-    allow_prop_to_outputs = tuple(isinstance(o, (UnspecifiedValue, AUTO))
-                                  for o in out_shardings)
+    allow_prop_to_inputs = (False,) * len(ordered_effects) + tuple(
+        isinstance(i, (UnspecifiedValue, AUTO)) for i in in_shardings)
+    allow_prop_to_outputs = (False,) * len(ordered_effects) + tuple(
+        isinstance(o, (UnspecifiedValue, AUTO)) or mlir.contains_unconstrained(o)
+        for o in out_shardings)
 
     mesh = None
     if auto_spmd_lowering:
@@ -3083,7 +3095,7 @@ class MeshExecutable(stages.XlaExecutable):
       ref_avals = self._all_args_info.in_avals
       debug_info = self._all_args_info.debug_info
 
-    all_arg_avals = map(xla.abstractify, kept_args)
+    all_arg_avals = map(core.abstractify, kept_args)
     check_arg_avals_for_call(ref_avals, all_arg_avals, debug_info)
     check_array_xla_sharding_layout_match(
         args_after_dce, self._in_shardings, self._xla_in_layouts, debug_info,
