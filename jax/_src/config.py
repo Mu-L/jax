@@ -214,7 +214,6 @@ def trace_context():
           sharding_in_types.value,
           use_direct_linearize.value,
           softmax_custom_jvp.value,
-          enable_memories.value,
           disable_jit.value,
           debug_key_reuse.value,
           jax_xla_profile_version.value,
@@ -972,20 +971,22 @@ pmap_shmap_merge = bool_state(
     upgrade=True,
     help='If True, pmap and shard_map API will be merged.')
 
-def _update_jax_memories_global(val):
-  jax_jit.global_state().enable_memories = val
+# Remove after next JAX release on Jan 15, 2025.
+if hasattr(jax_jit.global_state(), 'enable_memories'):
+  def _update_jax_memories_global(val):
+    jax_jit.global_state().enable_memories = val
 
-def _update_jax_memories_thread_local(val):
-  jax_jit.thread_local_state().enable_memories = val
+  def _update_jax_memories_thread_local(val):
+    jax_jit.thread_local_state().enable_memories = val
 
-enable_memories = bool_state(
-    'jax_enable_memories',
-    default=True,
-    upgrade=True,
-    update_global_hook=_update_jax_memories_global,
-    update_thread_local_hook=_update_jax_memories_thread_local,
-    help=("If True, will allow fetching memory kinds available on executable "
-          "and annotate Shardings with it."))
+  enable_memories = bool_state(
+      'jax_enable_memories',
+      default=True,
+      upgrade=True,
+      update_global_hook=_update_jax_memories_global,
+      update_thread_local_hook=_update_jax_memories_thread_local,
+      help=("If True, will allow fetching memory kinds available on executable "
+            "and annotate Shardings with it."))
 
 spmd_mode = enum_state(
     name='jax_spmd_mode',
@@ -1477,6 +1478,12 @@ custom_vjp_disable_shape_check = bool_state(
     upgrade=True,
     help='Disable the check from #19009 to enable some custom_vjp hacks.')
 
+mutable_array_checks = bool_state(
+    name='jax_mutable_array_checks',
+    default=False,
+    upgrade=True,
+    help='Enable error checks for mutable arrays that rule out aliasing.')
+
 xla_runtime_errors = bool_state(
     name='jax_experimental_unsafe_xla_runtime_errors',
     default=False,
@@ -1651,7 +1658,7 @@ array_garbage_collection_guard = optional_enum_state(
         ' do not log garbage collection of "jax.Array" objects.\n * "log":'
         ' log an error when a "jax.Array" is garbage collected.\n * "fatal":'
         ' fatal error if a "jax.Array" is garbage collected.\nDefault is'
-        ' "allow".'
+        ' "allow". Note that not all cycles may be detected.'
     ),
     update_global_hook=lambda val: _update_garbage_collection_guard(
         guard_lib.global_state(), 'garbage_collect_array', val
