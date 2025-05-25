@@ -82,6 +82,9 @@ class GridPointRecorderContext(object):
     return self._grid_points
 
 
+# TODO(jburnim): Figure out how to safely run different instance of TPU
+# interpret mode in parallel, and then remove this decorator.
+@jtu.thread_unsafe_test_class()
 class InterpretTest(jtu.JaxTestCase):
 
   def setUp(self):
@@ -520,6 +523,65 @@ class InterpretTest(jtu.JaxTestCase):
     x = jnp.arange(16 * 128, dtype=jnp.int32).reshape((16, 128))
     y = f(x)
     np.testing.assert_array_equal(y, x + 1)
+
+  def test_two_cores_along_parallel_dimension_with_race(self):
+    def kernel(x_ref, o_ref, vmem_ref):
+      vmem_ref[...] = x_ref[...]
+      o_ref[...] = x_ref[...] + vmem_ref[...]
+
+    x = jnp.ones((8, 128), jnp.float32)
+    y = pl.pallas_call(
+        kernel,
+        grid=(2,),
+        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        in_specs=[pl.BlockSpec(memory_space=pltpu.TPUMemorySpace.ANY)],
+        scratch_shapes=[
+            pltpu.VMEM(x.shape, x.dtype),
+        ],
+        interpret=mosaic_interpret.TPUInterpretParams(
+            num_cores_per_device=2,
+            detect_races=True,
+        ),
+        compiler_params=pltpu.TPUCompilerParams(
+            dimension_semantics=('parallel',),
+        ),
+    )(x).block_until_ready()
+    self.assertTrue(mosaic_interpret.races.races_found)
+    np.testing.assert_allclose(y, 2.0 * x)
+
+  def test_two_cores_along_parallel_dimension_no_race(self):
+    def kernel(x_ref, o_ref, vmem_ref):
+      vmem_ref[...] = x_ref[...]
+      o_ref[...] = x_ref[...] + vmem_ref[...]
+
+    x = jnp.ones((16, 128), jnp.float32)
+    y = pl.pallas_call(
+        kernel,
+        grid=(2,),
+        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        out_specs=pl.BlockSpec(
+            (8, 128),
+            lambda i: (i, 0),
+        ),
+        in_specs=[
+            pl.BlockSpec(
+                (8, 128),
+                lambda i: (i, 0),
+            ),
+        ],
+        scratch_shapes=[
+            pltpu.VMEM((8, 128), x.dtype),
+        ],
+        interpret=mosaic_interpret.TPUInterpretParams(
+            num_cores_per_device=2,
+            detect_races=True,
+        ),
+        compiler_params=pltpu.TPUCompilerParams(
+            dimension_semantics=('parallel',)
+        ),
+    )(x).block_until_ready()
+    self.assertFalse(mosaic_interpret.races.races_found)
+    np.testing.assert_allclose(y, 2.0 * x)
 
 
 if __name__ == '__main__':

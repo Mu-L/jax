@@ -321,6 +321,10 @@ class Scratch:
         init_callback(self._alloc_op.result)
 
 
+class _DefaultPredicate:
+  pass
+
+
 @dataclasses.dataclass()
 class LaunchContext:
   module: ir.Module
@@ -396,6 +400,7 @@ class LaunchContext:
       self,
       gmem_ref,
       gmem_transform: tuple[MemRefTransform, ...],
+      gmem_peer_id: int | ir.Value | None,
       transformed_slice_shape: tuple[int, ...],
       swizzle: int | None,
       reduction_op: Literal[
@@ -404,6 +409,7 @@ class LaunchContext:
   ):
     tma_desc_key = (gmem_ref, transformed_slice_shape, swizzle, gmem_transform)
     if (tma_desc := self.tma_descriptors.get(tma_desc_key, None)) is None:
+      i32 = ir.IntegerType.get_signless(32)
       i64 = ir.IntegerType.get_signless(64)
       ptr_ty = ir.Type.parse("!llvm.ptr")
       def init_tma_desc(host_ptr):
@@ -428,6 +434,25 @@ class LaunchContext:
         base_ptr = llvm.getelementptr(
             ptr_ty, alloc_ptr, [as_i64(offset)], [llvm_dyn], ref_ty.element_type, llvm.GEPNoWrapFlags.none,
         )
+        if gmem_peer_id is not None:
+          if not isinstance(gmem_peer_id, ir.Value):
+            peer_id = c(gmem_peer_id, i32)
+          else:
+            try:
+              # We try to reproduce the gmem_peer_id computation on the host.
+              peer_id = _recompute_peer_id(gmem_peer_id)
+            except ReplicationError as e:
+              raise ValueError(
+                  "Failed to recompute the async_copy peer id on the host"
+              ) from e
+          self._ensure_nvshmem_decls()
+          base_ptr = llvm.call(
+              base_ptr.type,
+              [base_ptr, peer_id],
+              [],
+              [],
+              callee="nvshmem_ptr",
+          )
         rank = ref_ty.rank
         assert rank * 2 == len(sizes_and_strides)
         swizzle_arg = (
@@ -503,15 +528,14 @@ class LaunchContext:
       dst_ref,
       gmem_slice: Any = (),
       gmem_transform: MemRefTransform | tuple[MemRefTransform, ...] = (),
+      gmem_peer_id: int | ir.Value | None = None,
       barrier: utils.BarrierRef | None = None,
       swizzle: int | None = None,
       arrive: bool | None = None,
-      uniform: bool = True,
       collective: Sequence[gpu.Dimension] | gpu.Dimension | None = None,
       partitioned: int | None = None,
-      predicate: (
-          ir.Value | None
-      ) = None,  # Should select 0 or 1 threads from the WG.
+      # Should select 0 or 1 threads from the WG.
+      predicate: ir.Value | None | _DefaultPredicate = _DefaultPredicate(),
       reduction_op: ReductionOp | None = None,
   ):
     """Initiates an async copy between GMEM and SMEM.
@@ -553,8 +577,8 @@ class LaunchContext:
           f"Expected same element type, got {element_type} and"
           f" {dst_ref_ty.element_type}"
       )
-    if predicate is not None and not uniform:
-      raise ValueError("Predicate can only be defined when uniform is True")
+    if isinstance(predicate, _DefaultPredicate):
+      predicate = utils.single_thread_predicate(utils.ThreadSubset.WARPGROUP)
     if not isinstance(gmem_transform, tuple):
       gmem_transform = (gmem_transform,)
 
@@ -748,20 +772,14 @@ class LaunchContext:
       multicast_mask = None
 
     tma_desc = self._get_tma_desc(
-        gmem_ref, gmem_transform, tuple(slice_shape), swizzle, reduction_op,
+        gmem_ref, gmem_transform, gmem_peer_id,
+        tuple(slice_shape), swizzle, reduction_op,
     )
 
     # We constuct TMA descriptors in column-major order.
     rev_dyn_base_indices = [
         arith.index_cast(i32, idx) for idx in reversed(dyn_base_indices)
     ]
-
-    uniform_ctx = (
-        functools.partial(
-            utils.single_thread, scope=utils.ThreadSubset.WARPGROUP)
-        if uniform and predicate is None
-        else contextlib.nullcontext
-    )
 
     if max(slice_shape) > 256:
       raise ValueError(
@@ -792,68 +810,65 @@ class LaunchContext:
           np.prod(slice_shape) * element_bitwidth * collective_size // 8, i32
       )
       barrier_ptr = barrier.get_ptr()
-      with uniform_ctx():
-        assert reduction_op is None
-        if collective_size > 1 and partitioned is not None:
-          if predicate is None:
-            predicate = c(1, ir.IntegerType.get_signless(1))
-          if arrive:
-            first_block = arith.cmpi(
-                arith.CmpIPredicate.eq, self.cluster_idx(collective), c(0, index),
-            )
-            arrive_predicate = arith.andi(predicate, first_block)
-            nvvm.mbarrier_arrive_expect_tx_shared(
-                barrier_ptr, transfer_bytes, predicate=arrive_predicate
-            )
-          rank = len(slice_shape)
-          idx_operands = ",".join(f"${i}" for i in range(4, 4 + rank))
-          llvm.inline_asm(
-              ir.Type.parse("!llvm.void"),
-              [predicate, smem_ptr, tma_desc, barrier_ptr, *rev_dyn_base_indices],
-              f"""
-              {{
-              .reg .b32 mapped_addr;
-              @$0 mapa.shared::cluster.u32 mapped_addr, $3, 0;
-              @$0 cp.async.bulk.tensor.{rank}d.shared::cta.global.tile.mbarrier::complete_tx::bytes.cta_group::2
-                                   [$1], [$2, {{{idx_operands}}}], [mapped_addr];
-              }}
-              """,
-              "b,r,l,r" + ",r" * rank,
-              has_side_effects=True,
+      assert reduction_op is None
+      if collective_size > 1 and partitioned is not None:
+        if predicate is None:
+          predicate = c(1, ir.IntegerType.get_signless(1))
+        if arrive:
+          first_block = arith.cmpi(
+              arith.CmpIPredicate.eq, self.cluster_idx(collective), c(0, index),
           )
-        else:
-          if arrive:
-            nvvm.mbarrier_arrive_expect_tx_shared(
-                barrier_ptr, transfer_bytes, predicate=predicate
-            )
-          nvvm.cp_async_bulk_tensor_shared_cluster_global(
-              smem_ptr, tma_desc, rev_dyn_base_indices, barrier_ptr, [],
-              multicast_mask=multicast_mask, predicate=predicate
+          arrive_predicate = arith.andi(predicate, first_block)
+          nvvm.mbarrier_arrive_expect_tx_shared(
+              barrier_ptr, transfer_bytes, predicate=arrive_predicate
           )
+        rank = len(slice_shape)
+        idx_operands = ",".join(f"${i}" for i in range(4, 4 + rank))
+        llvm.inline_asm(
+            ir.Type.parse("!llvm.void"),
+            [predicate, smem_ptr, tma_desc, barrier_ptr, *rev_dyn_base_indices],
+            f"""
+            {{
+            .reg .b32 mapped_addr;
+            @$0 mapa.shared::cluster.u32 mapped_addr, $3, 0;
+            @$0 cp.async.bulk.tensor.{rank}d.shared::cta.global.tile.mbarrier::complete_tx::bytes.cta_group::2
+                                  [$1], [$2, {{{idx_operands}}}], [mapped_addr];
+            }}
+            """,
+            "b,r,l,r" + ",r" * rank,
+            has_side_effects=True,
+        )
+      else:
+        if arrive:
+          nvvm.mbarrier_arrive_expect_tx_shared(
+              barrier_ptr, transfer_bytes, predicate=predicate
+          )
+        nvvm.cp_async_bulk_tensor_shared_cluster_global(
+            smem_ptr, tma_desc, rev_dyn_base_indices, barrier_ptr, [],
+            multicast_mask=multicast_mask, predicate=predicate
+        )
     else:
       assert multicast_mask is None
       if reduction_op is not None:
-        with uniform_ctx():
-          if predicate is None:
-            predicate = c(1, ir.IntegerType.get_signless(1))
-          rank = len(slice_shape)
-          idx_operands = ",".join(f"${i}" for i in range(3, 3 + rank))
-          llvm.inline_asm(
-            ir.Type.parse("!llvm.void"),
-            [predicate,smem_ptr,tma_desc,*rev_dyn_base_indices],
-            f"@$0 cp.reduce.async.bulk.tensor.{rank}d.global.shared::cta.{reduction_op}.tile.bulk_group [$2,{{{idx_operands}}}], [$1];",
-            "b,r,l" + ",r" * rank,
-            has_side_effects=True,
-          )
-          if arrive:
-            nvvm.cp_async_bulk_commit_group()
+        if predicate is None:
+          predicate = c(1, ir.IntegerType.get_signless(1))
+        rank = len(slice_shape)
+        idx_operands = ",".join(f"${i}" for i in range(3, 3 + rank))
+        llvm.inline_asm(
+          ir.Type.parse("!llvm.void"),
+          [predicate,smem_ptr,tma_desc,*rev_dyn_base_indices],
+          f"@$0 cp.reduce.async.bulk.tensor.{rank}d.global.shared::cta.{reduction_op}.tile.bulk_group [$2,{{{idx_operands}}}], [$1];",
+          "b,r,l" + ",r" * rank,
+          has_side_effects=True,
+        )
+        if arrive:
+          nvvm.cp_async_bulk_commit_group()
       else:
-        with uniform_ctx():
-          nvvm.cp_async_bulk_tensor_global_shared_cta(
-              tma_desc, smem_ptr, rev_dyn_base_indices, predicate=predicate
-          )
-          if arrive:
-            nvvm.cp_async_bulk_commit_group()
+        nvvm.cp_async_bulk_tensor_global_shared_cta(
+            tma_desc, smem_ptr, rev_dyn_base_indices, predicate=predicate
+        )
+        if arrive:
+          nvvm.cp_async_bulk_commit_group()
 
   def await_async_copy(
       self, allow_groups: int, await_read_only: bool = False
@@ -878,8 +893,18 @@ class LaunchContext:
   def to_remote(self, ref: ir.Value, peer: ir.Value):
     self._ensure_nvshmem_decls()
     if ir.MemRefType.isinstance(ref.type):
+      # We replace the offset in the ref type by 0, because memref_ptr always
+      # folds the offset into the pointer.
+      ref_ty = ir.MemRefType(ref.type)
+      strides, _ = ref_ty.get_strides_and_offset()
+      result_type = ir.MemRefType.get(
+          ref_ty.shape,
+          ref_ty.element_type,
+          ir.StridedLayoutAttr.get(0, strides),
+          ref_ty.memory_space,
+      )
       return utils.ptr_as_memref(
-          self.to_remote(utils.memref_ptr(ref), peer), ref.type
+          self.to_remote(utils.memref_ptr(ref), peer), result_type
       )
     if ref.type != ir.Type.parse("!llvm.ptr"):
       raise ValueError(f"Unsupported type for to_remote: {ref.type}")
@@ -891,3 +916,33 @@ class LaunchContext:
     self._ensure_nvshmem_decls()
     i32 = ir.IntegerType.get_signless(32)
     return llvm.call(i32, [], [], [], callee="nvshmem_my_pe")
+
+
+class ReplicationError(Exception):
+  pass
+
+def _recompute_peer_id(peer_id: ir.Value, fuel=8) -> ir.Value:
+  if fuel == 0:
+    raise ReplicationError(
+        "gmem_peer_id computation is too complicated to recompute on the host"
+    )
+  if isinstance(peer_id, ir.BlockArgument):
+    raise ReplicationError("Can't recompute a value that's a block argument")
+  op = peer_id.owner.opview
+  # We accept all arith ops
+  if op.OPERATION_NAME.startswith("arith."):
+    new_operands = [_recompute_peer_id(x, fuel - 1) for x in op.operands]
+    result_types = [r.type for r in op.results]
+    new_attributes = {na.name: na.attr for na in op.attributes}
+    new_op = ir.Operation.create(
+        op.OPERATION_NAME, result_types, new_operands, new_attributes
+    )
+    return new_op.results if len(new_op.results) > 1 else new_op.result
+  # nvshmem_my_pe queries the device id of the current process and works on both
+  # the host and the device.
+  if isinstance(op, llvm.CallOp) and op.callee.value == "nvshmem_my_pe":
+    i32 = ir.IntegerType.get_signless(32)
+    return llvm.call(i32, [], [], [], callee="nvshmem_my_pe")
+  raise ReplicationError(
+      f"Unrecognized op can't be recomputed on the host: {op}"
+  )

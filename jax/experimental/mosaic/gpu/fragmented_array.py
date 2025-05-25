@@ -1993,7 +1993,7 @@ class FragmentedArray:
       idxs = ([i] for i in self.layout.linear_thread_idxs())
     except NotImplementedError:
       ref_ = ref
-      idxs = self.layout.thread_idxs()
+      idxs = self.layout.thread_idxs(self.shape)
     ref_shape = tuple(ref_ty.shape)
     if ref_shape != self.shape:
       raise ValueError((ref_shape, self.shape))
@@ -2166,10 +2166,12 @@ class FragmentedArray:
       raise ValueError()
     nested_ref_shape = tuple(
         (ref_ty.shape[i], ref_ty.shape[i + ref_logical_rank])
+        if ref_ty.shape[i + ref_logical_rank] != 1 else (ref_ty.shape[i],)
         for i in range(ref_logical_rank)
     )
     nested_ref_strides = tuple(
         (ref_strides[i], ref_strides[i + ref_logical_rank])
+        if ref_ty.shape[i + ref_logical_rank] != 1 else (ref_strides[i],)
         for i in range(ref_logical_rank)
     )
     tiled_nested_shape, tiled_nested_strides = tiling.tile_nested_shape_strides(
@@ -2549,7 +2551,7 @@ def optimization_barrier(*arrays: mgpu.FragmentedArray):
   for array in arrays:
     reg_ty = array.registers.flat[0].type
     dtype = array.mlir_dtype
-    if ir.F32Type.isinstance(dtype):
+    if ir.F32Type.isinstance(dtype) or dtype == i32:
       if ir.VectorType.isinstance(reg_ty):
         [vec_len] = ir.VectorType(reg_ty).shape
         array_regs = [  # pylint: disable=g-complex-comprehension
@@ -2559,7 +2561,7 @@ def optimization_barrier(*arrays: mgpu.FragmentedArray):
         ]
       else:
         array_regs = list(array.registers.flat)
-      reg_constraint = "f"
+      reg_constraint = "r" if dtype == i32 else "f"
     elif ir.BF16Type.isinstance(dtype) or ir.F16Type.isinstance(dtype):
       if not ir.VectorType.isinstance(reg_ty):
         raise NotImplementedError(array.mlir_dtype)
@@ -2589,17 +2591,28 @@ def optimization_barrier(*arrays: mgpu.FragmentedArray):
   all_reg_constraints = ",".join(
       [*("=" + c for c in reg_constraints), *reg_constraints]
   )
-  struct_ty = ir.Type.parse(
-      f"!llvm.struct<({','.join(map(str, reg_dtypes))})>"
-  )
-  result_struct = llvm.inline_asm(
-      struct_ty, regs, ptx, all_reg_constraints,
-      asm_dialect=0, has_side_effects=True,
-  )
-  regs = [
-      llvm.extractvalue(dtype, result_struct, [i])
-      for i, dtype in enumerate(reg_dtypes)
-  ]
+
+  if len(reg_dtypes) == 1:
+    # The InlineAsm::verify() function doesn't allow a struct output when there
+    # is only one element (even though that seems to work for the case below).
+    result_elem = llvm.inline_asm(
+        reg_dtypes[0], regs, ptx, all_reg_constraints,
+        asm_dialect=0, has_side_effects=True,
+    )
+    regs = [result_elem]
+  else:
+    struct_ty = ir.Type.parse(
+        f"!llvm.struct<({','.join(map(str, reg_dtypes))})>"
+    )
+    result_struct = llvm.inline_asm(
+        struct_ty, regs, ptx, all_reg_constraints,
+        asm_dialect=0, has_side_effects=True,
+    )
+    regs = [
+        llvm.extractvalue(dtype, result_struct, [i])
+        for i, dtype in enumerate(reg_dtypes)
+    ]
+
   i32 = ir.IntegerType.get_signless(32)
   results = []
   regs_it = iter(regs)

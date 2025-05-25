@@ -244,8 +244,7 @@ build:ci_linux_aarch64_base --config=clang --verbose_failures=true
 build:ci_linux_aarch64_base --action_env=TF_SYSROOT="/dt10"
 build:ci_linux_aarch64_base --color=yes
 
-# Workaround for https://github.com/numpy/numpy/issues/28843
-# TODO(phawkins): remove this after upgrading to NumPy 2.2.6.
+# This appears to help avoid a timeout in CI for linalg_test.
 build:ci_linux_aarch64_base --test_env=OMP_NUM_THREADS=8
 
 build:ci_linux_aarch64 --config=ci_linux_aarch64_base
@@ -383,8 +382,7 @@ build:rbe_cross_compile_base --remote_instance_name=projects/tensorflow-testing/
 build:rbe_cross_compile_linux_aarch64 --config=cross_compile_linux_aarch64
 build:rbe_cross_compile_linux_aarch64 --config=rbe_cross_compile_base
 
-# Workaround for https://github.com/numpy/numpy/issues/28843
-# TODO(phawkins): remove this after upgrading to NumPy 2.2.6.
+# Avoids a timeout in linalg_test on ARM.
 build:rbe_cross_compile_linux_aarch64 --test_env=OMP_NUM_THREADS=8
 
 # Mac x86

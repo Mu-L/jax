@@ -144,7 +144,11 @@ def _debug_scalar_ty_format(arg):
     return "%f", arg
   raise NotImplementedError(f"Can't print the type {arg.type}")
 
-def debug_print(fmt, *args, uniform=True):
+def debug_print(fmt, *args, uniform=True, scope=None):
+  if not uniform and scope is not None:
+    raise ValueError("Cannot specify scope to a non-uniform debug_print.")
+  if scope is None:
+    scope = ThreadSubset.WARPGROUP
   type_formats = []
   new_args = []
   for arg in args:
@@ -168,7 +172,7 @@ def debug_print(fmt, *args, uniform=True):
       raise NotImplementedError(arg.type)
     type_formats.append(ty_format)
   ctx = (
-      functools.partial(single_thread, scope=ThreadSubset.WARPGROUP)
+      functools.partial(single_thread, scope=scope)
       if uniform
       else contextlib.nullcontext
   )
@@ -226,15 +230,19 @@ def when(cond):
     scf.yield_([])
 
 
-def thread_idx():
+def _3d_to_1d_idx(dim_idx_fn, dim_size_fn):
   i32 = ir.IntegerType.get_signless(32)
   as_i32 = lambda x: arith.index_cast(i32, x)
-  tidx = as_i32(gpu.thread_id(gpu.Dimension.x))
-  stride = as_i32(gpu.block_dim(gpu.Dimension.x))
+  idx = as_i32(dim_idx_fn(gpu.Dimension.x))
+  stride = as_i32(dim_size_fn(gpu.Dimension.x))
   for dim in (gpu.Dimension.y, gpu.Dimension.z):
-    tidx = arith.addi(tidx, arith.muli(as_i32(gpu.thread_id(dim)), stride))
-    stride = arith.muli(stride, as_i32(gpu.block_dim(dim)))
-  return tidx
+    idx = arith.addi(idx, arith.muli(as_i32(dim_idx_fn(dim)), stride))
+    stride = arith.muli(stride, as_i32(dim_size_fn(dim)))
+  return idx
+
+
+thread_idx = functools.partial(_3d_to_1d_idx, gpu.thread_id, gpu.block_dim)
+block_idx = functools.partial(_3d_to_1d_idx, gpu.block_id, gpu.grid_dim)
 
 
 def _warp_bcast(val, lane_idx=0):
@@ -511,12 +519,42 @@ def memref_reshape(ref: ir.Value, shape: tuple[int, ...]) -> ir.Value:
         f" allowed) {shape}"
     )
 
-  return _reshape(ref, list(ref_ty.shape), list(shape))
+  src_shape = list(ref_ty.shape)
+  dst_shape = list(shape)
+  if src_shape == dst_shape:
+    return ref
+  if not src_shape:
+    _, offset = ref_ty.get_strides_and_offset()
+    identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(0))
+    if ref_ty.layout == identity:
+      new_layout = ir.AffineMapAttr.get(ir.AffineMap.get_identity(len(dst_shape)))
+    else:
+      new_layout = ir.StridedLayoutAttr.get(offset, [1] * len(dst_shape))
+    result_ty = ir.MemRefType.get(dst_shape, ref_ty.element_type, new_layout, ref_ty.memory_space)
+    return memref.expand_shape(result_ty, ref, [], [], dst_shape)
+  if not dst_shape:
+    _, offset = ref_ty.get_strides_and_offset()
+    identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(ref_ty.rank))
+    contig_strided_1d = ir.Attribute.parse("strided<[1]>")
+    if ref_ty.layout == identity or ref_ty.layout == contig_strided_1d:
+      new_layout = ir.AffineMapAttr.get(ir.AffineMap.get_identity(0))
+    else:
+      new_layout = ir.StridedLayoutAttr.get(offset, [])
+    result_ty = ir.MemRefType.get((), ref_ty.element_type, new_layout, ref_ty.memory_space)
+    return memref.collapse_shape(result_ty, ref, [])
+  return _reshape(ref, src_shape, dst_shape)
 
 
 def memref_fold(ref: ir.Value, dim, fold_rank) -> ir.Value:
   ref_ty = ir.MemRefType(ref.type)
   new_shape = list(ref_ty.shape)
+  if dim < 0:
+    raise ValueError(f"Dimension {dim} is negative")
+  if dim + fold_rank > len(new_shape):
+    raise ValueError(
+        f"Folding {fold_rank} dimensions starting from {dim} is out of bounds"
+        f" for shape {new_shape}"
+    )
   new_shape[dim : dim + fold_rank] = [np.prod(new_shape[dim : dim + fold_rank])]
   identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(ref_ty.rank))
   contig_strided_1d = ir.Attribute.parse("strided<[1]>")
@@ -778,9 +816,16 @@ class BarrierRef:
     )
     return parity, arith.xori(parities, bitmask)
 
-  def arrive(self):
+  def arrive(self, arrival_count: int = 1, can_complete: bool = True):
     i64 = ir.IntegerType.get_signless(64)
-    nvvm.mbarrier_arrive_shared(i64, self.get_ptr())
+    if can_complete:
+      if arrival_count > 1:
+        count = c(arrival_count - 1, ir.IntegerType.get_signless(32))
+        nvvm.mbarrier_arrive_nocomplete_shared(i64, self.get_ptr(), count)
+      nvvm.mbarrier_arrive_shared(i64, self.get_ptr())
+    else:
+      count = c(arrival_count, ir.IntegerType.get_signless(32))
+      nvvm.mbarrier_arrive_nocomplete_shared(i64, self.get_ptr(), count)
 
   def arrive_expect_tx(
       self, bytes: int | ir.Value, predicate: ir.Value | None = None

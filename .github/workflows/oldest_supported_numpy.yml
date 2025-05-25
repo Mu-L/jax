@@ -10,7 +10,6 @@ on:
   push:
     branches:
       - main
-      - 'release/**'
 
 # This should also be set to read-only in the project settings, but it's nice to
 # document and enforce the permissions here.
@@ -24,7 +23,7 @@ concurrency:
 
 jobs:
   test-oldest-supported-numpy:
-    if: github.event.repository.fork == false
+    if: "github.event.repository.fork == false && !startsWith(github.head_ref, 'release/')"
     defaults:
       run:
         shell: bash
@@ -52,7 +51,7 @@ jobs:
           $JAXCI_PYTHON -m uv pip install -e .[minimum-jaxlib]
       # Halt for testing
       - name: Wait For Connection
-        uses: google-ml-infra/actions/ci_connection@main
+        uses: google-ml-infra/actions/ci_connection@7f5ca0c263a81ed09ea276524c1b9192f1304e3c
         with:
           halt-dispatch-input: ${{ inputs.halt-for-connection }}
       - name: Run Pytest CPU tests

@@ -13,48 +13,50 @@
 # limitations under the License.
 """Pallas helper functions."""
 
-from typing import Any, Protocol
-
 import jax
-import jax.numpy as jnp
-from jax._src.pallas import pallas_call
+from jax._src import checkify
+from jax._src import config
 from jax._src.pallas import core as pl_core
+from jax._src.pallas import pallas_call
 
 
 @jax.named_call
 def empty(
     shape: tuple[int, ...],
-    dtype: jnp.dtype,
+    dtype: jax.typing.DTypeLike,
     *,
-    memory_space: Any = None,
-    interpret: Any = False,
+    memory_space: object | None = None,
+    interpret: bool = False,
+    backend: pl_core.Backend | None = None,
 ):
-  def _empty_kernel(_):
-    # No-op to leave the out_ref uninitialized
-    pass
-
-  if memory_space is None:
-    kernel_memory_space = pl_core.MemorySpace.ANY
-    memory_space = jax.ShapeDtypeStruct
-  else:
-    kernel_memory_space = memory_space
-  return pallas_call.pallas_call(
-      _empty_kernel,
-      in_specs=[],
-      out_specs=pl_core.BlockSpec(memory_space=kernel_memory_space),
-      out_shape=memory_space(shape, dtype),
+  return empty_like(
+      jax.ShapeDtypeStruct(shape, dtype),
+      memory_space=memory_space,
       interpret=interpret,
-  )()
+      backend=backend,
+  )
 
 
-class ArrayLike(Protocol):
-  shape: tuple[int, ...]
-  dtype: jnp.dtype
-
-
+@jax.named_call
 def empty_like(
-    x: ArrayLike, *, memory_space: Any = None, interpret: Any = False):
-  return empty(x.shape, x.dtype, memory_space=memory_space, interpret=interpret)
+    x: object,
+    *,
+    memory_space: object | None = None,
+    interpret: bool = False,
+    backend: pl_core.Backend | None = None,
+):
+  if memory_space is None:
+    memory_space = pl_core.MemorySpace.ANY
+  return pallas_call.pallas_call(
+      # No-op to leave the out_ref uninitialized
+      lambda *_: None,
+      out_specs=jax.tree.map(
+          lambda _: pl_core.BlockSpec(memory_space=memory_space), x
+      ),
+      out_shape=x,
+      interpret=interpret,
+      backend=backend,
+  )()
 
 
 def when(condition):
@@ -65,3 +67,29 @@ def when(condition):
     else:
       jax.lax.cond(condition, f, lambda: None)
   return _wrapped
+
+
+_ENABLE_DEBUG_CHECKS = config.bool_state(
+    "jax_pallas_enable_debug_checks",
+    default=False,
+    help=(
+        "If set, ``pl.debug_check`` calls are checked at runtime. Otherwise,"
+        " they are a noop."
+    ),
+)
+
+
+enable_debug_checks = _ENABLE_DEBUG_CHECKS
+
+
+def debug_checks_enabled() -> bool:
+  """Returns runtime checks are enabled."""
+  return _ENABLE_DEBUG_CHECKS.value
+
+
+def debug_check(condition, message):
+  """Check the condition if
+  :func:`~jax.experimental.pallas.enable_debug_checks` is set, otherwise
+  do nothing.
+  """
+  return checkify.debug_check(condition, message)

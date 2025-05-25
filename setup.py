@@ -19,11 +19,11 @@ from setuptools import setup, find_packages
 
 project_name = 'jax'
 
-_current_jaxlib_version = '0.6.0'
+_current_jaxlib_version = '0.6.1'
 # The following should be updated after each new jaxlib release.
-_latest_jaxlib_version_on_pypi = '0.6.0'
+_latest_jaxlib_version_on_pypi = '0.6.1'
 
-_libtpu_version = '0.0.13.*'
+_libtpu_version = '0.0.15.*'
 
 def load_version_module(pkg_path):
   spec = importlib.util.spec_from_file_location(
@@ -57,7 +57,7 @@ setup(
     long_description_content_type='text/markdown',
     author='JAX team',
     author_email='jax-dev@google.com',
-    packages=find_packages(exclude=["*examples*", "*internal_test_util*"]),
+    packages=find_packages(exclude=["examples"]),
     package_data={'jax': ['py.typed', "*.pyi", "**/*.pyi"]},
     python_requires='>=3.10',
     install_requires=[
@@ -118,10 +118,12 @@ setup(
     url='https://github.com/jax-ml/jax',
     license='Apache-2.0',
     classifiers=[
+        "Development Status :: 5 - Production/Stable",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
         "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: Free Threading :: 3 - Stable",
     ],
     zip_safe=False,
 )

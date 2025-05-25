@@ -24,7 +24,7 @@ import itertools
 import logging
 import threading
 import time
-from typing import Any, Callable, NamedTuple
+from typing import Any
 
 import jax
 from jax._src import api
@@ -34,7 +34,6 @@ from jax._src import config
 from jax._src import core
 from jax._src import dtypes
 from jax._src import lib
-from jax._src import source_info_util
 from jax._src import traceback_util
 from jax._src import util
 from jax._src.abstract_arrays import array_types
@@ -43,6 +42,7 @@ from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
 from jax._src.interpreters import pxla
 from jax._src.interpreters import xla
+from jax._src.api_util import InternalFloatingPointError
 from jax._src.layout import DeviceLocalLayout, Layout
 from jax._src.lib import xla_client as xc
 from jax._src.mesh import AbstractMesh, Mesh
@@ -52,6 +52,7 @@ from jax._src.sharding import Sharding
 from jax._src.sharding_impls import (
     NamedSharding, SingleDeviceSharding, TransferToMemoryKind, GSPMDSharding,
     is_single_device_sharding)
+from jax._src.stages import SourceInfo
 import numpy as np
 
 
@@ -240,11 +241,6 @@ def jaxpr_has_prim_requiring_devices(jaxpr: core.Jaxpr) -> bool:
   return False
 
 
-class SourceInfo(NamedTuple):
-  source_info: source_info_util.SourceInfo
-  eqn_name: str
-
-
 @util.weakref_lru_cache
 def get_intermediate_shardings(
     jaxpr: core.Jaxpr) -> Sequence[tuple[Sharding, SourceInfo]]:
@@ -264,14 +260,12 @@ def get_intermediate_shardings(
       out.extend((i, source_info) for i in eqn.params['in_shardings'])
       out.extend((o, source_info) for o in eqn.params['out_shardings'])
     elif eqn.primitive is shard_map.shard_map_p:
-      if isinstance(eqn.params['mesh'], AbstractMesh):
+      mesh = eqn.params['mesh']
+      if isinstance(mesh, AbstractMesh):
         continue
       source_info = SourceInfo(eqn.source_info, eqn.primitive.name)
-      def _names_to_pspec(names):
-        ndmin = max(names) + 1 if names else 0
-        return PartitionSpec(*(names.get(i) for i in range(ndmin)))
-      out.extend((NamedSharding(eqn.params['mesh'], _names_to_pspec(names)), source_info)
-                 for names in [*eqn.params['in_names'], *eqn.params['out_names']])
+      out.extend((NamedSharding(mesh, spec), source_info)
+                 for spec in [*eqn.params['in_specs'], *eqn.params['out_specs']])
     elif eqn.primitive is device_put_p:
       source_info = SourceInfo(eqn.source_info, eqn.primitive.name)
       out.extend((s, source_info) for s in eqn.params['devices']
@@ -347,43 +341,6 @@ class CopySemantics(enum.Enum):
   ALIAS = enum.auto()
   COPY = enum.auto()
   DONATE = enum.auto()
-
-class InternalFloatingPointError(Exception):
-  name: str
-  ty: str
-
-  def __init__(self, name: str, ty: str):
-    self.name = name
-    self.ty = ty
-
-def maybe_recursive_nan_check(e: Exception, fun: Callable, args, kwargs,
-) -> None:  # always raises an exception
-  print("Invalid nan value encountered in the output of a jax.jit "
-        "function. Calling the de-optimized version.")
-  try:
-    _ = fun(*args, **kwargs)
-  except (FloatingPointError, ZeroDivisionError) as e2:
-    raise e2 from None
-  else:
-    _raise_no_nan_in_deoptimized(e)
-
-def _raise_no_nan_in_deoptimized(e) -> None:
-  msg = (f"{str(e)}. Because "
-        "jax_config.debug_nans.value and/or config.jax_debug_infs is set, the "
-        "de-optimized function (i.e., the function as if the `jit` "
-        "decorator were removed) was called in an attempt to get a more "
-        "precise error message. However, the de-optimized function did not "
-        "produce invalid values during its execution. This behavior can "
-        "result from `jit` optimizations causing the invalid value to be "
-        "produced. It may also arise from having nan/inf literals as "
-        "inputs or outputs, like `jax.jit(lambda ...: jax.numpy.nan)(...)`. "
-        "\n\n"
-        "It may be possible to avoid the invalid value by removing the "
-        "`jit` decorator, at the cost of losing optimizations. "
-        "\n\n"
-        "If you see this error, consider opening a bug report at "
-        "https://github.com/jax-ml/jax.")
-  raise FloatingPointError(msg) from None
 
 def _identity_fn(x):
   return x

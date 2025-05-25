@@ -303,11 +303,9 @@ py_library_providing_imports_info(
         "_src/callback.py",
         "_src/checkify.py",
         "_src/custom_batching.py",
-        "_src/custom_dce.py",
         "_src/custom_derivatives.py",
         "_src/custom_partitioning.py",
         "_src/custom_partitioning_sharding_rule.py",
-        "_src/custom_transpose.py",
         "_src/debugging.py",
         "_src/dispatch.py",
         "_src/dlpack.py",
@@ -316,8 +314,6 @@ py_library_providing_imports_info(
         "_src/ffi.py",
         "_src/flatten_util.py",
         "_src/interpreters/__init__.py",
-        "_src/interpreters/ad.py",
-        "_src/interpreters/batching.py",
         "_src/interpreters/pxla.py",
         "_src/pjit.py",
         "_src/prng.py",
@@ -325,9 +321,6 @@ py_library_providing_imports_info(
         "_src/random.py",
         "_src/shard_alike.py",
         "_src/shard_map.py",
-        "_src/sourcemap.py",
-        "_src/stages.py",
-        "_src/tree.py",
     ] + glob(
         [
             "*.py",
@@ -382,9 +375,11 @@ py_library_providing_imports_info(
     visibility = ["//visibility:public"],
     deps = [
         ":abstract_arrays",
+        ":ad",
         ":ad_util",
         ":api_util",
         ":basearray",
+        ":batching",
         ":cloud_tpu_init",
         ":compilation_cache_internal",
         ":compiler",
@@ -392,6 +387,8 @@ py_library_providing_imports_info(
         ":config",
         ":core",
         ":custom_api_util",
+        ":custom_dce",
+        ":custom_transpose",
         ":deprecations",
         ":dtypes",
         ":effects",
@@ -415,7 +412,10 @@ py_library_providing_imports_info(
         ":sharding_impls",
         ":sharding_specs",
         ":source_info_util",
+        ":sourcemap",
+        ":stages",
         ":traceback_util",
+        ":tree",
         ":tree_util",
         ":typing",
         ":util",
@@ -548,6 +548,7 @@ pytype_strict_library(
 pytype_strict_library(
     name = "compiler",
     srcs = ["_src/compiler.py"],
+    visibility = [":internal"] + jax_visibility("compiler"),
     deps = [
         ":cache_key",
         ":compilation_cache_internal",
@@ -592,6 +593,43 @@ pytype_strict_library(
 pytype_strict_library(
     name = "custom_api_util",
     srcs = ["_src/custom_api_util.py"],
+)
+
+pytype_strict_library(
+    name = "custom_dce",
+    srcs = ["_src/custom_dce.py"],
+    deps = [
+        ":ad",
+        ":api_util",
+        ":batching",
+        ":core",
+        ":custom_api_util",
+        ":mlir",
+        ":partial_eval",
+        ":source_info_util",
+        ":traceback_util",
+        ":tree_util",
+        ":util",
+    ],
+)
+
+pytype_strict_library(
+    name = "custom_transpose",
+    srcs = ["_src/custom_transpose.py"],
+    deps = [
+        ":ad",
+        ":ad_util",
+        ":api_util",
+        ":core",
+        ":custom_api_util",
+        ":mlir",
+        ":partial_eval",
+        ":source_info_util",
+        ":traceback_util",
+        ":tree_util",
+        ":util",
+        ":xla",
+    ],
 )
 
 pytype_strict_library(
@@ -671,6 +709,41 @@ pytype_strict_library(
 )
 
 pytype_strict_library(
+    name = "ad",
+    srcs = ["_src/interpreters/ad.py"],
+    deps = [
+        ":ad_util",
+        ":api_util",
+        ":config",
+        ":core",
+        ":dtypes",
+        ":mesh",
+        ":partial_eval",
+        ":source_info_util",
+        ":tree_util",
+        ":util",
+    ],
+)
+
+pytype_strict_library(
+    name = "batching",
+    srcs = ["_src/interpreters/batching.py"],
+    deps = [
+        ":ad_util",
+        ":config",
+        ":core",
+        ":mesh",
+        ":partial_eval",
+        ":partition_spec",
+        ":sharding_impls",
+        ":source_info_util",
+        ":tree_util",
+        ":typing",
+        ":util",
+    ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
     name = "mlir",
     srcs = ["_src/interpreters/mlir.py"],
     deps = [
@@ -723,6 +796,11 @@ pytype_strict_library(
 )
 
 pytype_strict_library(
+    name = "sourcemap",
+    srcs = ["_src/sourcemap.py"],
+)
+
+pytype_strict_library(
     name = "source_mapper",
     srcs = glob(include = ["experimental/source_mapper/**/*.py"]),
     visibility = [
@@ -733,6 +811,7 @@ pytype_strict_library(
         ":core",
         ":jax",
         ":source_info_util",
+        ":sourcemap",
     ] + py_deps("absl/flags"),
 )
 
@@ -835,6 +914,7 @@ pytype_strict_library(
         ":pallas_tpu_users",
     ],
     deps = [
+        ":dtypes",
         ":jax",
         ":pallas",
         ":pallas_tpu",
@@ -877,6 +957,7 @@ pytype_strict_library(
     deps = [
         ":mosaic_gpu",
         "//jax/_src/pallas/mosaic_gpu:core",
+        "//jax/_src/pallas/mosaic_gpu:helpers",
         "//jax/_src/pallas/mosaic_gpu:pallas_call_registration",  # build_cleaner: keep
         "//jax/_src/pallas/mosaic_gpu:pipeline",
         "//jax/_src/pallas/mosaic_gpu:primitives",
@@ -1000,6 +1081,26 @@ pytype_strict_library(
 )
 
 pytype_strict_library(
+    name = "stages",
+    srcs = ["_src/stages.py"],
+    visibility = [":internal"] + jax_visibility("stages"),
+    deps = [
+        ":config",
+        ":core",
+        ":layout",
+        ":mlir",
+        ":sharding",
+        ":sharding_impls",
+        ":source_info_util",
+        ":traceback_util",
+        ":tree_util",
+        ":typing",
+        ":util",
+        "//jax/_src/lib",
+    ],
+)
+
+pytype_strict_library(
     name = "compute_on",
     srcs = ["_src/compute_on.py"],
     deps = [
@@ -1110,6 +1211,14 @@ pytype_strict_library(
         ":typing",
         ":util",
     ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "tree",
+    srcs = ["_src/tree.py"],
+    deps = [
+        ":tree_util",
+    ],
 )
 
 pytype_strict_library(

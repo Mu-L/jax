@@ -15,6 +15,8 @@
 """Tests for distributed pallas GPU operations."""
 
 import functools
+import os
+
 import jax
 from jax import lax
 from jax._src import test_util as jtu
@@ -41,11 +43,11 @@ class PallasCallRemoteDMATest(jt_multiprocess.MultiProcessTest):
       self.skipTest("NVSHMEM library unavailable.")
     if jax.process_count() == 1:
       self.skipTest("Test requires multiple processes.")
+    if os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "") == "platform":
+      self.skipTest("NVSHMEM doesn't work with the platform allocator.")
     super().setUp()
 
   def test_basic_remote_dma(self):
-    if jax.process_count() < 2:
-      self.skipTest("Test requires multiple processes.")
     if jax.process_index() > 2:
       return  # Only 2 processes needed.
     def kernel(x_ref, y_ref, ready_sem, recv_sem):
@@ -62,7 +64,7 @@ class PallasCallRemoteDMATest(jt_multiprocess.MultiProcessTest):
                           device_id_type=pl.DeviceIdType.LOGICAL)
       pl.semaphore_wait(recv_sem)
 
-    x = jnp.arange(2 * 8 * 128.0).reshape((2 * 8, 128))
+    x = jnp.arange(2 * 8 * 128.0, dtype=jnp.float32).reshape((2 * 8, 128))
     def body(x):
       return pl.pallas_call(
           kernel,
@@ -86,6 +88,39 @@ class PallasCallRemoteDMATest(jt_multiprocess.MultiProcessTest):
     expected = x[8:] if jax.process_index() == 0 else x[:8]
     np.testing.assert_allclose(y.addressable_shards[0].data, expected)
 
+  def test_wait_twice(self):
+    if jax.process_index() > 2:
+      return  # Only 2 processes needed.
+
+    def kernel(y_ref, sem):
+      other_dev_id = 1 - lax.axis_index('x')
+      pl.semaphore_signal(sem, 2, device_id=other_dev_id,
+                          device_id_type=pl.DeviceIdType.LOGICAL)
+      pl.semaphore_wait(sem)
+      pl.semaphore_wait(sem)
+      y_ref[...] = jnp.ones_like(y_ref)
+
+    kernel_call = pl.pallas_call(
+        kernel,
+        out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
+        out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+        scratch_shapes=[plgpu.SemaphoreType.REGULAR],
+    )
+
+    devices = jax.devices()[:2]
+    mesh = jax.sharding.Mesh(devices, ['x'])
+    y = jax.jit(
+        shard_map.shard_map(
+            kernel_call, mesh, in_specs=(), out_specs=P(None), check_rep=False,
+        )
+    )()
+    np.testing.assert_allclose(y, jnp.ones_like(y))
+
 
 if __name__ == '__main__':
+  # This test doesn't work with the platform allocator, so we override it
+  # if it's ran alone. If it's part of a larger test suite and the platform
+  # allocator is used, setUp will skip the test.
+  os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.01'
+  os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'default'
   jt_multiprocess.main()

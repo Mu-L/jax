@@ -31,7 +31,6 @@ from jax._src import util
 from jax.experimental import io_callback
 from jax.experimental import pjit
 from jax._src.shard_map import shard_map
-from jax._src.lib import jaxlib_extension_version
 import jax.numpy as jnp
 from jax.sharding import Mesh
 import numpy as np
@@ -588,8 +587,6 @@ class PythonCallbackTest(jtu.JaxTestCase):
 
   @parameterized.parameters("int2", "int4", "uint2", "uint4", "float4_e2m1fn")
   def test_subbyte_operands(self, dtype: str):
-    if jaxlib_extension_version < 336:
-      self.skipTest("Requires jaxlib_extension_version >= 336.")
     if "2" in dtype and jtu.test_device_matches(["tpu"]):
       self.skipTest(
           "TODO(dsuo): TPU callbacks send SIGABRT for int2, uint2, and"
@@ -609,8 +606,6 @@ class PythonCallbackTest(jtu.JaxTestCase):
 
   @parameterized.parameters("int2", "int4", "uint2", "uint4", "float4_e2m1fn")
   def test_subbyte_results(self, dtype: str):
-    if jaxlib_extension_version < 336:
-      self.skipTest("Requires jaxlib_extension_version >= 336.")
     if "2" in dtype and jtu.test_device_matches(["tpu"]):
       self.skipTest(
           "TODO(dsuo): TPU callbacks send SIGABRT for int2, uint2, and"
@@ -630,8 +625,6 @@ class PythonCallbackTest(jtu.JaxTestCase):
 
   @parameterized.parameters("int2", "int4", "uint2", "uint4", "float4_e2m1fn")
   def test_non_default_stride_subbyte_results(self, dtype: str):
-    if jaxlib_extension_version < 336:
-      self.skipTest("Requires jaxlib_extension_version >= 336.")
     if "2" in dtype and jtu.test_device_matches(["tpu"]):
       self.skipTest(
           "TODO(dsuo): TPU callbacks send SIGABRT for int2, uint2, and"
@@ -1363,9 +1356,18 @@ class IOCallbackTest(jtu.JaxTestCase):
     jax.effects_barrier()
     self.assertEqual(_collected, expected)
 
-  def test_can_shard_io_callback_manually(self):
+  @parameterized.named_parameters(
+    dict(testcase_name='multi_device',
+         single_device=False),
+    dict(testcase_name='single_device',
+         single_device=True)
+  )
+  def test_can_shard_io_callback_manually(self, single_device: bool):
 
-    mesh = Mesh(np.array(jax.devices()), axis_names=('x',))
+    devices = jax.devices()
+    if single_device:
+      devices = devices[:1]
+    mesh = Mesh(np.array(devices), axis_names=('x',))
 
     spec = jax.sharding.PartitionSpec('x')
     sharding = jax.sharding.NamedSharding(mesh, spec)

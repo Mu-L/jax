@@ -44,6 +44,7 @@ from jax._src.state import types as state_types
 from jax._src.state.types import TransformedRef
 import jax.numpy as jnp
 
+
 class DynamicGridDim:
   def __repr__(self):
     return "DynamicGridDim"
@@ -954,7 +955,7 @@ index_map_grid_aval = jax_core.ShapedArray((), jnp.int32)
 class ScratchShape(Protocol):
   def get_array_aval(self) -> jax_core.AbstractValue:
     ...
-  def get_ref_aval(self) -> state.AbstractRef:
+  def get_ref_aval(self) -> state.AbstractRef | TransformedRef:
     ...
 
 

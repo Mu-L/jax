@@ -53,8 +53,7 @@ setup(
     install_requires=[f"jax-cuda{cuda_version}-pjrt=={__version__}"],
     extras_require={
       'with-cuda': [
-          # cudnn has a bug with mxfp8 with multiple GPUs per process and cublas 12.9
-          "nvidia-cublas-cu12>=12.1.3.1,<12.9",
+          "nvidia-cublas-cu12>=12.1.3.1",
           "nvidia-cuda-cupti-cu12>=12.1.105",
           "nvidia-cuda-nvcc-cu12>=12.6.85",
           "nvidia-cuda-runtime-cu12>=12.1.105",
@@ -79,10 +78,12 @@ setup(
     url="https://github.com/jax-ml/jax",
     license="Apache-2.0",
     classifiers=[
-        "Development Status :: 3 - Alpha",
+        "Development Status :: 5 - Production/Stable",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: Free Threading :: 3 - Stable",
     ],
     package_data={
         package_name: [

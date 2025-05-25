@@ -27,7 +27,6 @@ import unittest
 from absl.testing import absltest, parameterized
 import jax
 from jax._src import config
-from jax._src import lib as jaxlib
 from jax._src import test_util as jtu
 from jax._src.interpreters import mlir
 from jax._src.lib.mlir import ir
@@ -389,17 +388,19 @@ class MemRefTest(TestCase):
       ("add_1s", (5, 1, 2), (1, 1, 5, 1, 1, 2, 1, 1)),
       ("fold", (1, 5, 2, 1,), (1, 10, 1)),
       ("un", (1, 10, 1), (1, 5, 2, 1,)),
+      ("to_scalar", (1, 1, 1), ()),
+      ("from_scalar", (), (1, 1, 1)),
   )
   def test_reshape(self, inp_shape, out_shape):
     def kernel(ctx, inp, out, _):
       copy(memref_reshape(inp, out_shape), out)
 
-    x = np.arange(math.prod(inp_shape), dtype=jnp.float32).reshape(*inp_shape)
+    x = np.arange(math.prod(inp_shape), dtype=jnp.float32).reshape(inp_shape)
     out_ty = jax.ShapeDtypeStruct(out_shape, jnp.float32)
     y = mgpu.as_gpu_kernel(
         kernel, (1, 1, 1), (128, 1, 1), x, out_ty, ()
     )(x)
-    np.testing.assert_array_equal(y, x.reshape(*out_shape))
+    np.testing.assert_array_equal(y, x.reshape(out_shape))
 
   @parameterized.named_parameters([
       ("packed", (4, 4, 4), (16, 4, 1), 1, 2, False),
@@ -459,7 +460,7 @@ class MemRefTest(TestCase):
         " values read from the 32-bit input buffer to sometimes"
         " (nondeterministically) contain garbage.")
 
-    scalar = 42
+    scalar = dtype(42)
     expected = np.full((128, 128), scalar, dtype=dtype)
 
     def kernel(ctx, inp, out, _):
@@ -643,6 +644,19 @@ class WGMMALayoutTest(TestCase):
     np.testing.assert_array_equal(iota, expected)
 
 
+class I8Type:
+  """A type that represents a 8-bit signed integer.
+
+  This is a workaround to bypass the fact that we don't have a proper 8-bit
+  integer type class available in MLIR, and can't instantiate types without a
+  MLIR context.
+  """
+
+  @staticmethod
+  def get():  # pylint: disable=no-method-argument
+    return ir.IntegerType.get_signless(8)
+
+
 class WGMMATest(TestCase):
 
   def setUp(self):
@@ -653,7 +667,13 @@ class WGMMATest(TestCase):
   @parameterized.product(
       lhs_transpose=(False, True),
       rhs_transpose=(False, True),
-      in_mlir_dtype_cls=(ir.F16Type, ir.BF16Type, ir.F32Type),
+      in_mlir_dtype_cls=(
+          ir.F16Type,
+          ir.BF16Type,
+          ir.F32Type,
+          ir.Float8E5M2Type,
+          ir.Float8E4M3FNType,
+      ),
       m=(64, 128, 192),
       n=(64, 128, 192),
       k_steps=(1, 2),
@@ -662,7 +682,67 @@ class WGMMATest(TestCase):
       rhs_tiling_kind=("large", "small", "small+no_transpose"),
       lhs_tiling_kind=("large", "small", "small+no_transpose"),
   )
-  def test_wgmma_basic(
+  def test_wgmma_basic_float(
+      self,
+      lhs_transpose,
+      rhs_transpose,
+      in_mlir_dtype_cls,
+      m,
+      n,
+      k_steps,
+      swizzle,
+      jax_out_dtype,
+      rhs_tiling_kind,
+      lhs_tiling_kind,
+  ):
+    self._test_wgmma_basic(
+        m,
+        n,
+        k_steps,
+        in_mlir_dtype_cls,
+        lhs_transpose,
+        rhs_transpose,
+        swizzle,
+        jax_out_dtype,
+        rhs_tiling_kind,
+        lhs_tiling_kind,
+    )
+
+  @parameterized.product(
+      in_mlir_dtype_cls=(I8Type,),
+      m=(64, 128, 192),
+      n=(64, 128, 192),
+      k_steps=(1, 2),
+      swizzle=(32, 64, 128),
+      jax_out_dtype=(jnp.int32,),
+      rhs_tiling_kind=("large", "small", "small+no_transpose"),
+      lhs_tiling_kind=("large", "small"),
+  )
+  def test_wgmma_basic_int(
+      self,
+      in_mlir_dtype_cls,
+      m,
+      n,
+      k_steps,
+      swizzle,
+      jax_out_dtype,
+      rhs_tiling_kind,
+      lhs_tiling_kind,
+  ):
+    self._test_wgmma_basic(
+        m,
+        n,
+        k_steps,
+        in_mlir_dtype_cls,
+        lhs_transpose=False,
+        rhs_transpose=True,
+        swizzle=swizzle,
+        jax_out_dtype=jax_out_dtype,
+        rhs_tiling_kind=rhs_tiling_kind,
+        lhs_tiling_kind=lhs_tiling_kind,
+    )
+
+  def _test_wgmma_basic(
       self,
       m,
       n,
@@ -675,8 +755,12 @@ class WGMMATest(TestCase):
       rhs_tiling_kind,
       lhs_tiling_kind,
   ):
-    if jax_out_dtype == jnp.float16 and in_mlir_dtype_cls is not ir.F16Type:
-      self.skipTest("Only f16 input is supported for f16 output.")
+    if jax_out_dtype == jnp.int32 and in_mlir_dtype_cls != I8Type:
+      self.skipTest("s32 accumulator only supported with s8 inputs")
+    if jax_out_dtype != jnp.int32 and in_mlir_dtype_cls == I8Type:
+      self.skipTest("s8 inputs only supported with s32 accumulator")
+    if jax_out_dtype == jnp.float16 and in_mlir_dtype_cls in {ir.F32Type, ir.BF16Type}:
+      self.skipTest(f"{in_mlir_dtype_cls.get()} does not support f16 output.")
     if swizzle != 128 and lhs_transpose and lhs_tiling_kind == "large":
       self.skipTest("Transpose only supported in 128B swizzled WGMMA")
     if rhs_tiling_kind == "small+no_transpose" and not rhs_transpose:
@@ -686,10 +770,10 @@ class WGMMATest(TestCase):
 
     in_mlir_dtype = in_mlir_dtype_cls.get()
     out_mlir_dtype = utils.dtype_to_ir_type(jax_out_dtype)
+    if (lhs_transpose or not rhs_transpose) and bytewidth(in_mlir_dtype) != 2:
+      self.skipTest("Transpose only supported in 16-bit WGMMA")
     if ir.F32Type.isinstance(in_mlir_dtype):  # We actually use tf32 instead
       in_jax_dtype = jnp.float32
-      if lhs_transpose or not rhs_transpose:
-        self.skipTest("Transpose only supported in 16-bit WGMMA")
       exponent_bits, mantissa_bits = 8, 10  # Use tf32
     elif bytewidth(in_mlir_dtype) == 2:
       if n % 64 != 0:
@@ -702,10 +786,21 @@ class WGMMATest(TestCase):
         exponent_bits, mantissa_bits = 8, 7
       else:
         raise NotImplementedError(in_mlir_dtype)
+    elif in_mlir_dtype_cls == ir.Float8E5M2Type:
+      in_jax_dtype = jnp.float8_e5m2
+      exponent_bits, mantissa_bits = 5, 2
+    elif in_mlir_dtype_cls == ir.Float8E4M3FNType:
+      in_jax_dtype = jnp.float8_e4m3fn
+      exponent_bits, mantissa_bits = 4, 3
+    elif in_mlir_dtype_cls == I8Type:
+      in_jax_dtype = jnp.int8
+      exponent_bits = mantissa_bits = None
     else:
       raise NotImplementedError(in_mlir_dtype)
     nk_tile = swizzle // bytewidth(in_mlir_dtype)
     k = nk_tile * k_steps
+    if n % nk_tile:
+      self.skipTest("tiling does not divide N")
     assert m % 64 == 0 and n % nk_tile == 0
 
     small_rhs_tile = rhs_tiling_kind != "large"
@@ -739,7 +834,8 @@ class WGMMATest(TestCase):
       )
       for i in range(2):
         barriers[i].wait()
-      init_acc = mgpu.WGMMAAccumulator.zero(m=m, n=n, dtype=out_mlir_dtype)
+      is_signed = True if ir.IntegerType.isinstance(in_mlir_dtype) else None
+      init_acc = mgpu.WGMMAAccumulator.zero(m=m, n=n, dtype=out_mlir_dtype, is_signed=is_signed)
       if lhs_transpose:
         perm = (0, 1, 3, 2) if transpose_lhs_tiles else (1, 0, 3, 2)
         lhs_smem = memref_transpose(lhs_smem, perm)
@@ -756,9 +852,13 @@ class WGMMATest(TestCase):
       return jax.lax.reduce_precision(x, exponent_bits, mantissa_bits)
 
     x_shape = (k, m) if lhs_transpose else (m, k)
-    x = quantize(self.prng.uniform(-1, 1, x_shape)).astype(in_jax_dtype)
     y_shape = (n, k) if rhs_transpose else (k, n)
-    y = quantize(self.prng.uniform(-1, 1, y_shape)).astype(in_jax_dtype)
+    if in_mlir_dtype_cls == I8Type:
+      x = self.prng.integers(-128, 127, x_shape).astype(in_jax_dtype)
+      y = self.prng.integers(-128, 127, y_shape).astype(in_jax_dtype)
+    else:
+      x = quantize(self.prng.uniform(-1, 1, x_shape)).astype(in_jax_dtype)
+      y = quantize(self.prng.uniform(-1, 1, y_shape)).astype(in_jax_dtype)
     out_shape = jax.ShapeDtypeStruct((m, n), jax_out_dtype)
     if transpose_rhs_tiles:
       rhs_tiling_t = rhs_tiling[::-1] if rhs_transpose else rhs_tiling
@@ -781,6 +881,10 @@ class WGMMATest(TestCase):
     x32, y32 = x.astype(np.float32), y.astype(np.float32)
     ref = (x32.T if lhs_transpose else x32) @ (y32.T if rhs_transpose else y32)
     atol = 2e-2 if jax_out_dtype == jnp.float16 else 5e-6
+    if ir.IntegerType.isinstance(in_mlir_dtype) and ir.IntegerType.isinstance(out_mlir_dtype):
+      atol = 0
+    elif utils.bitwidth(in_mlir_dtype) == 8:
+      atol = 3e-2
     np.testing.assert_allclose(z, ref, atol=atol)
 
   # TODO(apaszke): Add support for f32
@@ -1451,6 +1555,25 @@ class TMATest(TestCase):
     x = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
     smem = (x, mgpu.TMABarrier())
     y = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), x, x, smem)(x)
+    np.testing.assert_array_equal(y, x)
+
+  def test_tma_with_1d_tiling(self):
+    swizzle = 128
+    dtype = jnp.float16
+    shape = (64, 128)
+    tiling = (1, swizzle // jnp.dtype(dtype).itemsize)
+    def kernel(ctx, dst, smem):
+      iota_tensor(*shape, dtype=dtype).store_tiled(smem, swizzle=swizzle)
+      ctx.async_copy(
+          src_ref=smem,
+          dst_ref=dst,
+          swizzle=swizzle,
+          gmem_transform=mgpu.TileTransform(tiling),
+      )
+      ctx.await_async_copy(0)
+    x = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
+    smem = jax.ShapeDtypeStruct(utils.tile_shape(shape, tiling), dtype)
+    y = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), (), x, smem)()
     np.testing.assert_array_equal(y, x)
 
   @parameterized.named_parameters(
@@ -2328,6 +2451,21 @@ class FragmentedArrayTest(TestCase):
     f = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), x, x, None)
     np.testing.assert_array_equal(f(x), x * 3)
 
+  def test_optimization_barrier_with_single_value(self):
+    shape = (64, 64)
+    value = 5.0
+    dtype = jnp.float32
+    def kernel(ctx, out, smem):
+      del ctx, smem
+      mlir_type = utils.dtype_to_ir_type(dtype)
+      arr = mgpu.FragmentedArray.splat(c(value, mlir_type), shape)
+      arr = mgpu.optimization_barrier(arr)
+      arr.store_untiled(out)
+
+    out_shape = jax.ShapeDtypeStruct(shape, dtype)
+    f = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), (), out_shape, ())
+    np.testing.assert_array_equal(f(), jnp.full(shape, value, dtype=dtype))
+
   def test_convert_bool_to_u8(self):
     m, n = 128, 128
     def kernel(ctx, dst, _):
@@ -2992,10 +3130,6 @@ class MosaicGpuDialectTest(TestCase, jtu.JaxTestCase):
       ((64,), (128, 64), [1]),
   )
   def test_broadcast_in_dim(self, input_shape, output_shape, bcast_dims):
-    # TODO(dasenov): Remove this after the minimal jaxlib version is 0.6.1.
-    if jaxlib.version < (0, 6, 1):
-      self.skipTest("Test requires jaxlib version >= 0.6.1")
-
     element_value = 42.0
     def body(ctx, result_gmem_ref, smem):
       del ctx

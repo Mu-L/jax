@@ -104,6 +104,13 @@ def supports_cross_device_collectives():
     nvshmem_bc_path = os.environ["MOSAIC_GPU_NVSHMEM_BC_PATH"]
   except KeyError:
     return False
+  if nvshmem_so_path := os.environ.get("MOSAIC_GPU_NVSHMEM_SO_PATH", ""):
+    try:
+      # This both ensures that the file exists, and it populates the dlopen
+      # cache, helping XLA find the library even if the RPATH is not right...
+      ctypes.CDLL(nvshmem_so_path)
+    except OSError:
+      return False
   xla_flags = os.environ.get("XLA_FLAGS", "")
   return (
       os.path.exists(nvshmem_bc_path)
@@ -670,7 +677,7 @@ def as_gpu_kernel(
   if launch_ctx.is_device_collective and not supports_cross_device_collectives():
     raise RuntimeError("Kernel is a cross-device collective but no support is available.")
 
-  expected_arg_treedef = jax.tree.structure(in_shape)
+  expected_arg_tys, expected_arg_treedef = jax.tree.flatten(in_shape)
   def _check_args(*args):
     arg_treedef = jax.tree.structure(args)
     if arg_treedef != expected_arg_treedef:
@@ -678,6 +685,20 @@ def as_gpu_kernel(
           f"Invalid argument structure: expected {expected_arg_treedef}, got"
           f" {arg_treedef}, ({args=})"
       )
+    for arg, expected_ty in zip(args, expected_arg_tys):
+      if arg.shape != expected_ty.shape:
+        raise ValueError(
+            f"Argument shape mismatch: expected {expected_ty.shape}, got"
+            f" {arg.shape}"
+        )
+      if arg.dtype != expected_ty.dtype:
+        hint = ""
+        if not arg.shape:
+          hint = f". Hint: cast the scalar to {expected_ty.dtype} explicitly."
+        raise ValueError(
+            f"Argument dtype mismatch: expected {expected_ty.dtype}, got"
+            f" {arg.dtype}{hint}"
+        )
 
   def bind(*args) -> Any:
     return mosaic_gpu_p.bind(*args, module=module, out_types=out_shape)
