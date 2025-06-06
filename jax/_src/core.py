@@ -433,37 +433,31 @@ def new_jaxpr_eqn(invars, outvars, primitive, params, effects, source_info=None,
 _var_counter = it.count()
 
 class Var:
-  __slots__ = ["count", "suffix", "aval", "initial_qdd", "final_qdd"]
+  __slots__ = ["count", "aval", "initial_qdd", "final_qdd"]
 
   count: int
-  suffix: str
   aval: AbstractValue
   # these are only useful for jaxpr binders but rather than create a separate
   # type for those, breaking existing interpreters, we add fields here.
   initial_qdd : QuasiDynamicData | None
   final_qdd : QuasiDynamicData | None
 
-  def __init__(
-      self, suffix: str, aval: AbstractValue, initial_qdd=None, final_qdd=None
-  ):
+  def __init__(self, aval: AbstractValue, initial_qdd = None, final_qdd = None):
+    assert isinstance(aval, AbstractValue)
     self.count = next(_var_counter)
-    self.suffix = suffix
     self.aval = aval
     self.initial_qdd = initial_qdd
     self.final_qdd = final_qdd
 
   def __repr__(self):
-    return f"Var(id={id(self)}){self.suffix}:{self.aval.str_short()}"
+    return f'Var(id={id(self)}):{self.aval.str_short()}'
 
   def pretty_print(self, context: JaxprPpContext, *, print_dtype: bool = True):
     del print_dtype  # unused
-    return f"{context.var_names[self]}{self.suffix}"
+    return f"{context.var_names[self]}"
 
 
-def gensym(suffix: str = "") -> Callable:
-  """Produce distinct variables, printed with the optional suffix."""
-  return partial(Var, suffix)
-
+gensym = lambda: Var
 
 # In a jaxpr, `dropvar` can appear in place of a bound variable to indicate that
 # the assignment is dropped, i.e. that an expression's output value will never
@@ -471,7 +465,7 @@ def gensym(suffix: str = "") -> Callable:
 # treat it as a special case of one. Its `aval` is similarly inexact.
 class DropVar(Var):
   def __init__(self, aval: AbstractValue):
-    super().__init__("", aval)
+    super().__init__(aval)
   def __repr__(self): return '_'
   def pretty_print(self, context: JaxprPpContext, *, print_dtype: bool = True):
     del context, print_dtype  # unused
@@ -2352,6 +2346,7 @@ class MutableArray:
   dtype = property(lambda self: self._aval.dtype)
   sharding = property(lambda self: self._buf.sharding)
   format = property(lambda self: self._buf.format)
+  committed = _committed = property(lambda self: self._buf._committed)
   def __getitem__(self, idx): return self._aval._getitem(self, idx)
   def __setitem__(self, idx, x): return self._aval._setitem(self, idx, x)
   def __repr__(self) -> str: return 'Mutable' + repr(self[...])
@@ -3377,13 +3372,13 @@ def pp_kv_pair(k:str, v: Any, context: JaxprPpContext, settings: JaxprPpSettings
 def pp_kv_pairs(kv_pairs, context: JaxprPpContext, settings: JaxprPpSettings) -> pp.Doc:
   if not kv_pairs:
     return pp.nil()
-  return pp.group(
+  return pp.group(pp.concat([
     pp.nest(2, pp.concat([
       pp.text("["),  pp.brk(""),
       pp.join(pp.brk(), [pp_kv_pair(k, v, context, settings) for k, v in kv_pairs])
-    ]))
-    + pp.brk("") + pp.text("]")
-  )
+    ])),
+    pp.brk(""), pp.text("]")
+  ]))
 
 def pp_eqn(eqn: JaxprEqn, context: JaxprPpContext, settings: JaxprPpSettings
            ) -> pp.Doc:
@@ -3404,7 +3399,7 @@ def _pp_eqn(eqn: JaxprEqn, context: JaxprPpContext, settings: JaxprPpSettings,
   rhs = [pp.text(eqn.primitive.name, annotation=name_stack_annotation),
          pp_kv_pairs([(p, eqn.params[p]) for p in params], context, settings),
          pp.text(" ") + pp_vars(eqn.invars, context)]
-  if lhs.format():
+  if eqn.outvars:
     return pp.concat([lhs, pp.text(" = ", annotation=annotation), *rhs])
   else:
     return pp.concat(rhs)
@@ -3499,10 +3494,10 @@ def pp_jaxpr(
 def pp_jaxprs(jaxprs: Sequence[ClosedJaxpr | Jaxpr],
               context: JaxprPpContext, settings: JaxprPpSettings) -> pp.Doc:
   jaxprs = [j.jaxpr if isinstance(j, ClosedJaxpr) else j for j in jaxprs]
-  return pp.group(pp.nest(2, pp.concat([
+  return pp.group(pp.concat([pp.nest(2, pp.concat([
       pp.text('('), pp.brk(""),
       pp.join(pp.brk(), map(lambda x: pp_jaxpr(x, context, settings), jaxprs))]
-    )) + pp.brk("") + pp.text(')')
+    )), pp.brk(""), pp.text(')')])
   )
 
 
